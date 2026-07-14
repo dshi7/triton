@@ -828,6 +828,10 @@ class CUDABackend(BaseBackend):
         nvidia.passes.hopper.add_multi_cta_reduction(pm)
         # TODO: Find the optimal place in the pipeline for this pass.
         nvidia.passes.ttnvgpuir.add_prune_unused_barriers(pm)
+        # Auto-insert task-scoped barriers for intra-task aliased-TMEM
+        # write-after-read hazards (missing barrier between a tcgen05 read and
+        # an aliased overwrite whose per-warp footprints overlap).
+        nvidia.passes.ttnvgpuir.add_insert_tmem_alias_war_barrier(pm)
         if knobs.nvidia.enable_interleave_tmem:
             nvidia.passes.ttnvgpuir.add_interleave_tmem(pm)
         passes.ttgpuir.add_reduce_data_duplication(pm)
