@@ -3020,39 +3020,13 @@ private:
   SmallVector<BufferT *> buffers;
   DenseMap<Operation *, ttng::TmemDataChannelPost *> allocToChannel;
 
-  /// Check whether dstOp is in the forward SSA slice of srcOp,
-  /// i.e. dstOp transitively uses a result of srcOp.  Also follows
-  /// memory dependencies (local_store, tmem_store).
+  /// Check whether dstOp is in the forward SSA slice of srcOp, i.e. dstOp
+  /// transitively uses a result of srcOp.  Also follows memory dependencies
+  /// (local_store, tmem_store).  Delegates to the shared `dependsThroughMemory`
+  /// (CodePartitionUtility) so the planner and code partitioning use one source
+  /// of truth for reuse-chain data dependencies.
   static bool isDataDependent(Operation *srcOp, Operation *dstOp) {
-    SmallVector<Operation *, 16> worklist;
-    DenseSet<Operation *> visited;
-    auto enqueueUsers = [&](Operation *op) {
-      for (Value result : op->getResults()) {
-        for (Operation *user : result.getUsers()) {
-          if (visited.insert(user).second)
-            worklist.push_back(user);
-        }
-      }
-      if (isa<triton::gpu::LocalStoreOp>(op) ||
-          isa<triton::nvidia_gpu::TMEMStoreOp>(op)) {
-        for (Value operand : op->getOperands()) {
-          if (isa<triton::gpu::MemDescType>(operand.getType())) {
-            for (Operation *user : operand.getUsers()) {
-              if (user != op && visited.insert(user).second)
-                worklist.push_back(user);
-            }
-          }
-        }
-      }
-    };
-    enqueueUsers(srcOp);
-    while (!worklist.empty()) {
-      Operation *op = worklist.pop_back_val();
-      if (op == dstOp)
-        return true;
-      enqueueUsers(op);
-    }
-    return false;
+    return dependsThroughMemory(srcOp, dstOp);
   }
 
   /// Look up the BufferT for a given alloc operation.
