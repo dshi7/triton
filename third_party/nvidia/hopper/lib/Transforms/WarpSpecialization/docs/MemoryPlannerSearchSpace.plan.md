@@ -77,11 +77,193 @@ Remaining (perf / coverage, not correctness):
   check (a real project), not just exposing the existing trigger.
 - Accumulator per-outer-tile TMEM multi-copy (currently pinned to 1).
 - Model scaled-MMA scale columns for TMEM.
+- **N-way (≥3) TMEM reuse grouping, aligned with code partitioning** — see the
+  dedicated section below. This is the gap that keeps FA-bwd `_BWD_DOT_ATTRS_TMEM`
+  from being reproducible without hand-pinned `channels` (task T279873316).
 **Covers (future)**: `WSMemoryPlanner.cpp`, new `WSMemoryPlanSearch.{h,cpp}`
 **Related docs**: [SmemAllocationDesign.md](SmemAllocationDesign.md),
 [TMEMAllocationHeuristics.md](TMEMAllocationHeuristics.md),
 [ReuseGroups.md](ReuseGroups.md), [AccumulationCounters.md](AccumulationCounters.md),
 [BwdTmemReuseSlotHazard.md](BwdTmemReuseSlotHazard.md)
+
+---
+
+## N-way (≥3) TMEM reuse grouping — align the planner with code partitioning
+
+**Status: dependency-walk unification DONE (commit `ff0bff2e4`); planner N-way
+GROUPING still TODO. Task T279873316.**
+
+**Done (`ff0bff2e4`, refined by `8997960ee`):** one shared `dependsThroughMemory`
+(CodePartitionUtility) used by both passes; a `getRootBuffer` subview-climb lets
+the walk cross a multi-buffered alloc (store into `memdesc_index(base,i)` connects
+to a read from `memdesc_index(base,j)` — the shape that hid `dsT→dq`). The climb
+is gated behind `followBufferReuse`, used ONLY by code partitioning's
+`hasDependencyChain` (to ORDER an already-decided reuse); the planner's
+`isDataDependent` keeps the narrow walk (the wide walk over-forms reuse groups).
+
+**REVERTED (`8997960ee`) — the same-partition restriction is UNSOUND (again).**
+`ff0bff2e4` also restricted the program-order fallback to a single partition
+(dropping cross-partition textual order). A full-suite run caught the regression
+this warns about below: **HSTU 2-KV cross-attention bwd (`reduce_dq`) produced
+wrong `dq` (rel-L2 ~0.79)** — a real kernel with a legitimate cross-partition
+program-order reuse that `getRootBuffer` does not capture as a memory dep. Fix:
+restore cross-partition program order. **Consequence: the hand-pinned
+`{qkT,dpT,dq}` bad-group no longer fast-fails** (it is spuriously orderable via
+program order → downstream blowup). Genuinely-unorderable groups
+(`{dpT,dsT,dq}` in `ws_code_partition_tmem_3group_no_chain`) still fail fast.
+So the badgroup fast-fail remains the OPEN N-way crux, exactly as below.
+
+Validated after the fix: FA-bwd (40), HSTU cross-attn bwd (18), autoWS
+GEMM+addmm+quant (140), autoWS FA (72), HSTU self-attn fwd/bwd (2/2), LIT
+WarpSpecialization (125; decision checks in `verify_reuse_group_decisions.mlir`).
+
+**Still TODO:** the planner's `hasPotentialReuse` is pairwise/greedy and does not
+*assemble* the N≥3 group `{dpT,dsT,dq}` even though the pairwise deps are now all
+visible (`test_bwd_bm128_memtype_only_xfail` still xfails). That is the remaining
+group-formation work — see "What's left — 3 steps + gate" below — no longer blocked
+on the dep predicate.
+
+### The gap
+Today the planner forms TMEM reuse groups **pairwise** via `hasPotentialReuse`
+(disjoint op-id liveness + a *direct* data dependency). That cannot form a real
+N≥3 chain like FA-bwd `{dpT, dsT, dq}` (config `_BWD_DOT_ATTRS_TMEM`), because the
+`dq↔dsT` pair has **no pairwise dependency**: `dq` reads `dsT` from SMEM while
+`dk` reads it from TMEM, so they are common-ancestor siblings, not a direct
+producer→consumer. So the group only ever forms **by hand-pinned `channels`**.
+Consequences observed (BM128 memtype-only, `test_bwd_bm128_memtype_only_xfail`):
+the planner instead picks `{dpT,dq}`+`{dsT,ppT,qkT}` and **OOBs TMEM**, because the
+tight 3-way `{dpT,dq,dsT}` (which fits) is unreachable.
+
+### The alignment idea
+Code partitioning already has the **group-level** safety predicate the planner
+lacks: `verifyReuseGroupCrossPartition` + `orderReuseGroupChain`
+(`CodePartitionUtility.cpp`). It accepts an N≥3 single-copy TMEM group iff its
+channels admit a **unique total dependency-chain order** (Kahn with a unique head
+each step; edges from `hasDependencyChain` = SSA use-def **or** same-block program
+order). For `{dpT,dsT,dq}` that is `dpT→dsT` (SSA) then `dsT→dq`. Factor this into
+**one shared predicate** used by both passes so the planner forms only groups
+code partitioning can prove safe — making the existing "handled-or-bail /
+`report_fatal_error`" contract unreachable instead of a late surprise.
+
+### Two lessons from reverted attempts (do NOT repeat)
+
+1. **Pairwise "same-partition disjoint reuse" in the planner is unsound.** It
+   found a fitting packing (peak 448) but (a) blew up compile >5 min and (b) chose
+   `{qkT,dpT,dq}` — `qkT`'s slot is not truly free (its value lives on through
+   `pT`). Op-id-disjoint within a partition is *not* real disjointness.
+
+2. **Tightening `hasDependencyChain`'s program-order fallback to same-partition,
+   *without* a memory-complete data-dep walk, is unsound.** On its own it
+   regressed 11 FA-bwd + 1 lit test: group `{dpT,dq}` (channels 9/12, `buffer.id
+   5`) went `verifyReuseGroup2 chain=1 → chain=0`, dropping its cross-iteration WAR
+   barrier → wrong `dq`. **Root cause (later found):** the `dpT→dsT→dq` dependency
+   *is* real, but the walk couldn't trace it — `dsT` lives in a multi-buffered
+   alloc and the store/read use different `memdesc_index` slot-views, so the walk
+   dead-ended at the store's subview. The good binary was leaning on the
+   cross-partition program-order fallback to paper over this. **Resolution
+   (`ff0bff2e4`):** make the walk climb subview→base (`getRootBuffer`) so the real
+   dep is found; *then* the same-partition-only rule is sound and
+   non-regressing. Lesson: don't drop the program-order fallback until the
+   data-dep walk is memory-complete.
+
+### The two helper stacks — the divergence to unify
+The two passes maintain **parallel, duplicated** reuse machinery that has drifted
+apart:
+
+| Concern | Memory planner (`WSMemoryPlanner.cpp`) | Code partitioning (`CodePartitionUtility.cpp`) |
+|---|---|---|
+| dependency walk | `isDataDependent` (l.3025) — **memory-aware**: follows SSA results **and** store→memdesc→load | `hasDependencyChain` (l.780) — **memory-blind** (SSA results only) **+ a program-order fallback** |
+| pairwise reuse legality | `hasPotentialReuse` (l.3707): size-fits **AND** op-id **liveness disjoint** (`bufferRange` intervals don't intersect) **AND** a data dependency (either dir) | `verifyReuseGroup2` (l.905): column **overlap** **AND** a chain (data-dep **or** same-block program order) |
+| N≥3 group legality | **— none —** (pairwise, greedy) | `orderReuseGroupChain` / `verifyReuseGroupCrossPartition` (unique Kahn order) |
+| ordering evidence | **op-id liveness disjointness** (a scheduling fact) | re-derives order from chain direction / program order |
+
+`verifyReuseGroup2` is called **only** by code partitioning (`WSCodePartition.cpp:3370`);
+the planner never calls it. So the planner *decides* a reuse from liveness+data-dep,
+and code partitioning independently *re-proves* it from chain direction to place the
+barrier — two predicates that can disagree.
+
+Note the dq path (corrects an earlier misreading): `dq`'s **producer** is the GEMM
+`tc_gen5_mma %dq_trans(=memdesc_trans %dsT), %k, %dq`, which reads `dsT` **directly**
+from the shared SMEM buffer — a clean `dpT→dsT→dq_producer` chain, no staging. The
+early-TMA **staging is on dq's *consumer*** side (`tmem_load %dq` → reshape/trans/
+split → `descriptor_reduce` for the subtiled dQ atomic add). Staging is irrelevant to
+reuse ordering.
+
+### Cases checked and the decision each pass should reach
+| group | data dep? | op-id liveness disjoint? | desired decision | reason |
+|---|---|---|---|---|
+| `{dpT,dq}` (id5) | **yes** — `dpT→dsT→dq` via `memdesc_trans` of shared `%dsT` | yes | **accept**, order `dpT`→`dq`, emit cross-iter WAR barrier | real producer→consumer |
+| `{dpT,dsT,dq}` (3-way, target) | `dpT→dsT` (SSA), `dsT→dq` (shared buf) | yes | **accept**, unique chain order | the config only hand-pinning produces today |
+| `{qkT,ppT}` | `qkT→…→ppT` (p feeds ppT) | yes | **accept** | real chain |
+| `{qkT,dpT,dq}` (badgroup) | **no** (`qkT⊥dpT`) | **no** — `qkT` lives on through `pT` | **reject** | independent + overlapping liveness → race, currently hangs code-partition >5 min |
+| `{ppT,dsT}` (badgroup) | **no** (`ppT⊥dsT`) | — | **reject** | independent members, no safe order |
+
+The planner's own liveness gate (`hasPotentialReuse` l.3713: `if intersects → return 0`)
+**already rejects** `{qkT,dpT,dq}` — which is why the planner never proposes it and it
+only arises via hand-pinned `channels`. The robustness gap is purely that a
+pinned-illegal group is not *fast-failed*.
+
+### The real discriminator (corrected)
+`{qkT,dpT,dq}` (unsafe) vs `{dpT,dsT,dq}` (safe) differ by whether the members
+admit a **genuine dependency-chain order**, **not** by op-id liveness. Op-id
+liveness is NOT a sound signal — the `test_bwd_bm128_memtype_only_xfail` reason
+confirms it **underestimates `qkT`'s lifetime** (its value lives on through `pT`),
+so a liveness-disjoint test would wrongly accept `qkT` sharing. The sound gate is
+the **group-level dependency-chain** predicate `orderReuseGroupChain`: a unique
+total order over the members whose edges come from `dependsThroughMemory`
+(memory-complete, `followBufferReuse=true`) or in-partition program order.
+`{dpT,dsT,dq}` orders uniquely (`dpT→dsT` data dep, then `dsT→dq`); `{qkT,dpT,dq}`
+has no order (`qkT⊥dpT`) → rejected. (An earlier revision of this doc proposed a
+`livenessOrder` edge; that is superseded — see "Empirical note — RESOLVED".)
+
+### What's left — 3 steps + gate (to make `test_bwd_bm128_memtype_only_xfail` pass)
+**Prereq DONE:** the shared memory-complete `dependsThroughMemory` (+`getRootBuffer`)
+and code partitioning's `orderReuseGroupChain` / `verifyReuseGroupCrossPartition`,
+which already order the 3-way — proven by `ws_code_partition_tmem_3group_chain.mlir`
+and the hand-pinned `_BWD_DOT_ATTRS_TMEM`. The only gap is that the **planner does
+not FORM the group**.
+
+1. **Share the group-level legality predicate.** Expose `orderReuseGroupChain` /
+   `verifyReuseGroupCrossPartition` (backed by `dependsThroughMemory(followBufferReuse
+   =true)`) so the planner can validate a candidate N≥3 TMEM group — even when a
+   member pair (`dq↔dsT(tmem)`) has **no pairwise dep** (common-ancestor siblings:
+   `dk` reads the TMEM copy, `dq` the SMEM copy).
+
+2. **N-way group formation in the planner (the new logic).** Extend reuse formation
+   from pairwise-greedy to: propose **extending** a reuse group with a further member
+   and accept iff the shared predicate returns a **unique chain**. Keep the
+   **pairwise packing gate narrow** (`hasPotentialReuse` / `followBufferReuse=false`)
+   — only the N-way *extension* check uses the wide/group predicate. This forms
+   `{dpT,dsT,dq}` **without** the wide walk over-forming pairwise groups (which
+   regressed HSTU 2-KV). Wire it into the plan-space search's TMEM packer, which today
+   does only pairwise liveness-disjoint column reuse (copies pinned to 1).
+
+3. **Feasibility-aware ranking.** Prefer the grouping that **fits** — `{dpT,dsT,dq}`
+   (512 cols) — over the greedy `{dpT,dq}`+`{dsT,ppT,qkT}` that **OOBs**. Reject
+   infeasible (OOB) plans in the static feasibility gate and let the search explore
+   the alternative grouping; rank by the shared predicate + occupancy, not occupancy
+   alone.
+
+**Gate:** `test_bwd_bm128_memtype_only_xfail` flips to pass (planner forms
+`{dpT,dsT,dq}` from memtype-only annotations); and NO regression — `test_bwd_tmem_
+dsT_reuse_3group` (hand-pinned 3-way), FA-bwd (40), HSTU cross-attn bwd (18), autoWS
+GEMM+addmm+quant (140)/FA (72)/self-attn (2/2), WS LIT (125) all stay green. The key
+invariant: N-way formation must NOT broaden the *pairwise* packing gate (keep
+`followBufferReuse=false` there), or HSTU 2-KV over-forms and miscompiles again.
+
+(Separately, the pinned-illegal `t_bwd_badgroup.py` fast-fail — reaching the
+unorderable-group `report_fatal_error` before the >5-min downstream blowup — is a
+robustness nicety, not required for the gate above.)
+
+### Empirical note — RESOLVED
+The earlier `chain=0` puzzle was the multi-buffer/subview blind spot above: the
+`{dpT,dq}` chain flows `dpT.consumer(tmem_load) → dsT(store into memdesc_index base,i)
+→ dq(reads memdesc_index base,j)`, and the walk dead-ended at the store's subview.
+`getRootBuffer` (climb subview→base, fan to all slot-views) fixes it — confirmed by
+instrumented `dataDep` traces going `0→1` and the FA-bwd suite going green. The
+ordering source is therefore the **data dependency** (through the buffer), not a
+separate `livenessOrder`; same-partition program order remains only for genuine
+in-partition ordering. Regression-guarded by `reuse_group_2buffer_multibuf.mlir`.
 
 ---
 
