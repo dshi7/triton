@@ -94,7 +94,7 @@ computeWarpFootprint(RankedTensorType regTy, ttg::MemDescType tmemTy,
     for (int r = 0; r < nReg; ++r)
       for (int l = 0; l < nLane; ++l) {
         for (auto &p : pt)
-          p.second = (p.first == kReg) ? r
+          p.second = (p.first == kReg)    ? r
                      : (p.first == kLane) ? l
                      : (p.first == kWarp) ? w
                                           : 0;
