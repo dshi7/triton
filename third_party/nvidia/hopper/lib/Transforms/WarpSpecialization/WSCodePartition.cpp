@@ -2680,6 +2680,9 @@ void replaceBufferReuse(triton::FuncOp funcOp, ReuseConfig *config) {
                                     repCh->getAllocOp()->getResult(0));
           }
           channel->getAllocOp()->erase();
+          // The alloc (and endpoints reached through it) is now dangling; mark
+          // the channel so later reuse-group walks don't deref freed ops.
+          channel->defunct = true;
           continue;
         }
         // Types don't match for SMEM - cannot reinterpret SMEM like TMEM
@@ -2778,6 +2781,9 @@ void replaceBufferReuse(triton::FuncOp funcOp, ReuseConfig *config) {
 
       // All users were successfully replaced, safe to erase
       channel->getAllocOp()->erase();
+      // The alloc (and endpoints reached through it) is now dangling; mark the
+      // channel so later reuse-group walks don't deref freed ops.
+      channel->defunct = true;
     }
   }
 }
