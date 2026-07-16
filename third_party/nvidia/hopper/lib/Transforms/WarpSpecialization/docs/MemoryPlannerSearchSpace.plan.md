@@ -90,8 +90,12 @@ Remaining (perf / coverage, not correctness):
 
 ## N-way (≥3) TMEM reuse grouping — align the planner with code partitioning
 
-**Status: dependency-walk unification DONE (commit `ff0bff2e4`); planner N-way
-GROUPING still TODO. Task T279873316.**
+**Status: dependency-walk unification DONE (commit `ff0bff2e4`); sound N-way
+predicate + verify harness DONE (`80dde009a`); enumeration-path N-way join DONE
+(`b019a73be`, NFC); planner N-way GROUPING now SOLVED via a post-pass
+(`repairUnsafeReuseGroups`, working change) — `test_bwd_bm128_memtype_only_xfail`
+PASSES. Task T279873316. See "Implementation log & final design (2026-07-16)"
+below for the shipped design and the dead ends.**
 
 **Done (`ff0bff2e4`, refined by `8997960ee`):** one shared `dependsThroughMemory`
 (CodePartitionUtility) used by both passes; a `getRootBuffer` subview-climb lets
@@ -264,6 +268,276 @@ instrumented `dataDep` traces going `0→1` and the FA-bwd suite going green. Th
 ordering source is therefore the **data dependency** (through the buffer), not a
 separate `livenessOrder`; same-partition program order remains only for genuine
 in-partition ordering. Regression-guarded by `reuse_group_2buffer_multibuf.mlir`.
+
+---
+
+## Implementation log & final design (2026-07-16)
+
+This section closes the N-way TMEM reuse thread above. It documents the shipped
+design (a **post-pass repair**, `repairUnsafeReuseGroups`), the sound predicate it
+rests on, every alternative that was tried and rejected, and two supporting bug
+fixes that had to land first. Task **T279873316**.
+
+Commits on this branch (`git log --oneline`), oldest→newest:
+- `f99b9c0ce` — Fix f16-in-f32 TMEM reuse materialization validation (`TMEMAlloc1D.cpp`)
+- `45e976ce9` — Fix use-after-free on reuse-folded channel endpoints (`defunct` flag)
+- `80dde009a` — Sound N-way reuse predicate (`crossPartitionProgOrder`) + memory-planner verify harness
+- `b019a73be` — [NFC] N-way sibling reuse formation in the TMEM **enumeration** path (`canJoinReuseGroupChain`)
+- **working change (uncommitted)** — `repairUnsafeReuseGroups` post-pass in `WSMemoryPlanner.cpp` (the fix that makes BM128 pass)
+
+### 1. Problem recap — why BM128 needs `{dpT, dsT, dq}`
+
+FA-bwd at `BLOCK_M1=128` runs five MMAs whose TMEM accumulators/operands must be
+packed into ≤512 columns: `qkT`, `dpT`, `dv`, `dq`, `dk`. The hand-tuned config
+`_BWD_DOT_ATTRS_TMEM`
+(`fused_attention_ws_device_tma.py:607`) makes this fit by pinning **buffer
+ids** (the trailing int of each `"opnd..,mem,copies,ID"` channel string):
+
+```
+qkT: opndD,tmem,1,2   dpT: opndD,tmem,1,5   dv: opndA,tmem,1,2 / opndD,tmem,1,7
+dq:  opndD,tmem,1,5   dk:  opndA,tmem,1,5  / opndD,tmem,1,10
+```
+
+Decoding the shared ids: **id 2** = `{qkT`'s output (opndD), `ppT` = dv's opndA}`
+(the "qk shares with ppT" 2-way); **id 5** = `{dpT`'s output, `dq`'s output,
+`dsT` = dk's opndA}` — the **3-way** `{dpT, dsT, dq}`; id 7 = dv; id 10 = dk.
+
+The 3-way is the crux. `dq` and `dsT` are **common-ancestor siblings**, not a
+producer→consumer pair:
+- `dpT → dsT` is a real SSA data dep (`dsT` is computed from `dpT`).
+- `dk` reads `dsT` from **TMEM** (the `opndA,tmem,1,5` operand).
+- `dq`'s producer GEMM reads `dsT` from **SMEM** via `memdesc_trans %dsT`.
+
+So there is **no pairwise `dsT→dq` (or `dq↔dsT`) producer→consumer edge**: both
+`dq` and `dk` consume the same ancestor `dsT` through different memory spaces. The
+planner's pairwise gate `hasPotentialReuse`
+(`WSMemoryPlanner.cpp:3742`) requires size-fit **AND** op-id liveness
+disjointness **AND** a bidirectional data dependency (`isDataDependent`,
+`:3757–3758`). With no `dq↔dsT` data dep, `hasPotentialReuse` returns 0 for that
+pair, so the 3-way can never be assembled from pairwise steps. Without it the
+planner packs `{dpT,dq}` + `{dsT,ppT,qkT}` and **OOBs TMEM** (the tight 512-col
+3-way is unreachable) — the `xfail` at `fused_attention_ws_device_tma.py:1920`.
+
+### 2. Architecture: search vs heuristics vs post-pass
+
+TMEM allocation lives in `allocateTMemAllocs2` (`WSMemoryPlanner.cpp:4230`) and
+has **two search modes**, both driven by the **same heuristics**:
+
+| Mode | Entry | When |
+|---|---|---|
+| First-fit (default) | `tryAllocate` (`:3907`), a greedy DFS returning the **first** feasible packing | always, unless top-K opt-in |
+| Top-K enumeration | `enumerateTMemAllocations` (`:4128`), collects distinct feasible packings, ranks by peak columns | opt-in: `TRITON_WS_MEM_PLAN_TOPK>1` or a `mem_plan_pick`>0 |
+
+Both modes call the identical legality/placement heuristics:
+- `hasPotentialReuse` (`:3742`) — the pairwise reuse gate (size + liveness + data dep).
+- `computeColOffset` (`:3775`) — where a candidate packs inside an owner's columns.
+- `findPlacements` (`:3696`) — where to open a brand-new column range (row-group gap search).
+- `tmemStatePeakCols` (`:4084`) — the peak-column occupancy used to rank enumerated plans.
+
+**Owner identity is emergent, not chosen.** A buffer becomes a reuse-group
+**owner** only when it opens new space (`findPlacements` → `addOwnerToState`);
+every other buffer becomes a **reuser** of some owner (`hasPotentialReuse` +
+`computeColOffset`). Nothing declares "dsT is an owner"; whichever buffer first
+needs fresh columns holds the slot. This is central to why the dead ends below
+failed — you cannot make `dpT` an owner just by relaxing a predicate.
+
+**Default-path guard (byte-identical).** The dispatch at
+`WSMemoryPlanner.cpp:4297–4301` reads `topK`/`pick` and only enters enumeration
+when `topK > 1 || pick > 0`; the comment states *"Default (topK=1, pick=0) keeps
+the exact first-fit path so non-search compiles are byte-identical."* Rank 0 is
+always pinned to the first-fit packing (`:4326–4338`), so `pick=0` under search
+still equals the default. This guard is what lets the N-way experiments (and the
+verify harness) exist without touching any shipping compile.
+
+### 3. The sound predicate (`80dde009a`)
+
+The group-level legality question — *"do these N channels admit a unique
+dependency-chain order?"* — was already answered for **code partitioning** by
+`orderReuseGroupChain` / `verifyReuseGroupCrossPartition`
+(`CodePartitionUtility.cpp`), a Kahn topological sort over edges from
+`hasDependencyChain` (`:869`). The edge policy had two sources: (1) a
+memory-complete data dep (`dependsThroughMemory(..., followBufferReuse=true)`),
+and (2) **same-block program order** — used *even across partitions*.
+
+`80dde009a` adds a `crossPartitionProgOrder` flag to `hasDependencyChain` and
+`orderReuseGroupChain` (default `true`):
+
+```cpp
+// hasDependencyChain(A, B, crossPartitionProgOrder=true)
+// (2) program order within the same block.
+if (aConsumer->getBlock() == bProducer->getBlock()) {
+  if (!crossPartitionProgOrder) {
+    // Sound-gate mode: textual order is a happens-before ONLY when a single
+    // partition (shared async_task_id) runs both ops.
+    ... if (!sharePartition) return false; ...
+  }
+  return appearsBefore(aConsumer, bProducer);
+}
+```
+
+**Why cross-partition textual order is not a happens-before.** Distinct async
+tasks (warp groups) run **concurrently**; their relative position in the IR text
+says nothing about execution order. For *ordering an already-decided* reuse (what
+code partitioning does — it just needs to place the WAR barrier), that
+approximation happens to be load-bearing for some real kernels, so the default
+stays `true`. But for **deciding whether to FORM** a group it is unsound: it would
+"order" independent siblings that actually race.
+
+**What dropping it buys (the group-formation gate, `crossPartitionProgOrder=false`):**
+- `{qkT, ppT, dsT}` — `ppT` and `dsT` are cross-partition and data-independent →
+  no edge → **REJECT** (this is the group first-fit wrongly forms at BM128).
+- `{qkT, dpT, dq}` — `qkT ⊥ dpT` → **REJECT**.
+- `{dpT, dsT, dq}` — `dpT→dsT` (SSA) and `dsT→dq` (through the shared buffer, via
+  `getRootBuffer`) are genuine data deps → orders uniquely `dpT→dsT→dq` →
+  **ACCEPT**.
+
+So the sound gate accepts exactly the real chain and rejects the two spurious
+cross-partition sibling groups — without changing code partitioning (which keeps
+the default `true`).
+
+**Verify harness + lit test (the fast-iteration net).** `80dde009a` also wires an
+observation-only mode into the planner
+(`WSMemoryPlanner.cpp:3403`, gated by `TRITON_WS_MEM_PLAN_VERIFY_GROUPS`): it
+enumerates every candidate pair/triple of a loop's TMEM allocs, runs
+`orderReuseGroupChain(..., /*crossPartitionProgOrder=*/false)`, and prints
+`[ws-mem-plan-verify] group {..} => ACCEPT order=… / REJECT` per group. It
+**changes no planning decision** (prints via `llvm::errs()`, no assertions build
+needed), so it stays on a plain RUN line. `test/Hopper/WarpSpecialization/ws_mem_plan_verify_reuse_groups.mlir`
+pins the three canonical FA-bwd verdicts (real chain ACCEPT, two badgroups
+REJECT) — the safety net for iterating on the predicate without a GPU.
+
+### 4. Things tried and WHY they failed (do not repeat)
+
+**(a) Relaxing `hasPotentialReuse` / adding `canJoin` in the DEFAULT first-fit
+`tryAllocate` — reverted.** The obvious move is to let the first-fit path form the
+sibling group directly. It does not work because first-fit is **greedy
+first-feasible** (`:3944–3969`: sort candidates, take the first that recurses to a
+full packing). In buffer order, `dpT` reaches `dk` as a feasible reuse **owner**
+before the 3-way can assemble, so `dpT` becomes a **reuser of `dk`**, not an owner
+holding the `{dpT,dsT,dq}` slot. Under the emergent-owner structure (§2) the 3-way
+then cannot form at all. It also risks perturbing the byte-identical default path
+(regression surface across the whole green suite). Rejected.
+
+**(b) `canJoinReuseGroupChain` in the ENUMERATION path (`b019a73be`, kept as NFC)
++ `mem_plan_pick` sweep — insufficient on its own.** `canJoinReuseGroupChain`
+(`WSMemoryPlanner.cpp:3820`) lets a candidate join an owner's group as a
+time-multiplexed (offset-0) member when the *whole* prospective ≥3 group orders
+under the sound predicate — exactly the common-ancestor sibling case. It is wired
+**only** into `enumerateTMemAllocations` (`:4155–4165`), so default compiles are
+untouched (verified: default BM128 still xfails, LIT unchanged). But enumeration
+explores **owner assignments incrementally in buffer order**, and assembling
+`{dpT,dsT,dq}` needs the 2-member seed `{dpT,dsT}` to exist **before** `dq` can
+join. The bridge member `dsT` sorts **last** in buffer order, while `dq` and `dpT`
+have no pairwise dep to seed on — so the group is **never seeded**. Empirically
+confirmed: a `mem_plan_pick` sweep 0..17 with `topK=32` produced **0 passes**.
+
+**Lesson:** incremental, order-dependent formation (first-fit *or* enumeration)
+**cannot** assemble a common-ancestor sibling group whose bridge member sorts
+last, regardless of how clever the join predicate is. The group must be repaired
+**after** a complete packing exists, not built up member-by-member. That is what
+motivated the post-pass (§5).
+
+**(c) Earlier: tightening `hasDependencyChain`'s program-order fallback to
+same-partition *globally* — reverted (`8997960ee`).** Doing this as a global
+change (not a separate flag) regressed **HSTU 2-KV cross-attention bwd
+`reduce_dq`** (wrong `dq`, rel-L2 ~0.79) — a real kernel with a legitimate
+cross-partition program-order reuse edge. This is precisely why `80dde009a`
+introduces `crossPartitionProgOrder` as a **separate opt-in flag** (default
+`true`) rather than changing the global edge policy: code partitioning keeps the
+permissive policy it needs; only the planner's group-formation gate uses the
+strict one.
+
+### 5. The chosen design: post-pass repair (`repairUnsafeReuseGroups`)
+
+The shipped fix (working change, `WSMemoryPlanner.cpp:3844–3906`) operates on the
+**final** first-fit packing, so it is immune to the ordering problem in §4(b):
+
+1. First-fit (`tryAllocate`) finalizes the packing as usual.
+2. `repairUnsafeReuseGroups` runs to a fixpoint (`:4356–4358`, `while (repair…) {}`).
+3. Each call: for every reuse group that is **not chain-orderable** (≥3 members,
+   single copy, `orderReuseGroupChain(&g, /*crossPartitionProgOrder=*/false)`
+   returns empty), it tries to **relocate a reuser member** (never the owner — the
+   owner holds the slot) into another group where it forms a chain-orderable slot
+   (`canJoinReuseGroupChain`), **provided removing it leaves the source group
+   orderable** (`orderable(rest)`). One relocation per call; the loop repeats.
+
+Termination: each move takes a member from an unsafe group to a safe one, so it
+converges. Order-independence: it inspects the *complete* packing and its group
+membership, not an incremental build order — so the "bridge sorts last" trap
+(§4b) does not apply.
+
+**Inert / NFC-until-triggered.** `orderable(mem)` returns `true` immediately for
+any group with `< 3` members and for any already-orderable ≥3 group, so the pass
+fires **only** when first-fit produced an unorderable ≥3 single-copy group. Every
+packing first-fit already gets right is byte-identical — the whole green suite is
+untouched by construction.
+
+**What it does for BM128.** First-fit yields `{qkT,ppT,dsT}` (unorderable —
+`ppT⊥dsT`) plus `{dpT,dq}`. The pass detects the unsafe group, finds that removing
+`dsT` leaves `{qkT,ppT}` orderable, and that `dsT` can join `{dpT,dq}` as a
+chain-orderable member (`dpT→dsT→dq`), so it relocates `dsT`:
+
+```
+{qkT,ppT,dsT}(unsafe) + {dpT,dq}   →   {qkT,ppT} + {dpT,dsT,dq}
+```
+
+This is **exactly** the hand-pinned `_BWD_DOT_ATTRS_TMEM` packing (id 2 =
+`{qkT,ppT}`, id 5 = `{dpT,dsT,dq}`). Result:
+`test_bwd_bm128_memtype_only_xfail` now **PASSES** from memtype-only annotations,
+with no hand-pinned buffer ids.
+
+Note the post-pass reuses `canJoinReuseGroupChain` (from `b019a73be`) as its
+"can this member land here safely?" check, so `b019a73be` — NFC on its own — is a
+load-bearing dependency of the fix.
+
+### 6. Two supporting bug fixes (had to land first)
+
+**f16-in-f32 materialization validation (`f99b9c0ce`, `TMEMAlloc1D.cpp`).**
+`sliceAndReinterpretMDTMEM` validated a reuse subslice using the **reuser's
+logical** column count, but the planner assigns `buffer.offset` in **physical**
+TMEM columns. For an f16 reuser packed inside an f32 owner, two f16 elements share
+one 32-bit column, so the reuser occupies `blockN/2` physical columns — the code
+already halves the width in the subslice branch, but the bounds check used the full
+`blockN`, spuriously rejecting a valid non-zero offset (e.g. `offset=64,
+blockN=128 → 64+128 > 128` OOB) and aborting. Fix: compute `sliceCols = blockN/2`
+when `oldElemTyWidth == elemTyWidth*2` and validate against that same physical
+width. Without this, the `{dpT,dsT,dq}` packing (mixed element widths) fails to
+materialize.
+
+**Reuse-folded-endpoint use-after-free (`45e976ce9`, `defunct` flag).** When a
+reuse group is folded into its representative, the non-representative channel's
+`allocOp` is erased (`replaceBufferReuse`, `WSCodePartition.cpp`), leaving that
+`Channel`'s endpoints dangling. A later reuse-group walk
+(`needAccumCntForReuse → enclosing → isProperAncestor`) dereferenced the freed op.
+Whether a given endpoint was already erased is **iteration-order dependent**, so
+it was a **layout-sensitive heisenbug** (vanished under IR dumping). Fix: add a
+`defunct` flag to `Channel` set at both erase sites; `getSrcOp()/getDstOp()`
+return null when defunct, and `needAccumCntForReuse` skips defunct channels (the
+representative covers their space) plus null-guards the endpoints. This is what
+made the N-way folding reliable enough to test.
+
+### 7. Validation status & remaining work
+
+**Verified:**
+- WS LIT suite: 116 pass + 11 xfail (includes the new
+  `ws_mem_plan_verify_reuse_groups.mlir`).
+- autoWS FA correctness: 72 passed.
+- `test_bwd_bm128_memtype_only_xfail`: now **PASSES** with the post-pass build
+  (the group forms as `{dpT,dsT,dq}` + `{qkT,ppT}`).
+
+**Remaining work:**
+- **Full regression re-run** with the post-pass compiled in (the full `run_all.sh`
+  autoWS matrix + HSTU cross-attn bwd) to confirm the "inert unless triggered"
+  claim end-to-end on a GPU.
+- **Flip the xfail marker** on `test_bwd_bm128_memtype_only_xfail`
+  (`fused_attention_ws_device_tma.py:1911–1919`) to a normal test once the
+  post-pass lands.
+- **Extend the post-pass** if needed: it currently does single-reuser relocation
+  into another owner's group. Consider whether it should also try **2-way
+  relocations** (move two members) or handle **multi-buffer** (copies>1) groups —
+  neither is required for the BM128 gate but both are plausible for other configs.
+- **Land the working change** (`repairUnsafeReuseGroups` is currently uncommitted).
+- Meta task: **T279873316**.
 
 ---
 
