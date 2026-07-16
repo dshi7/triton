@@ -72,12 +72,15 @@ pool-vs-sum A/B); any case's `run_*.py` runner for correctness-only
 
 Today the corpus fixtures (`schedule_graph.json` and the committed
 `generated.py`) are produced by the **Modulo Scheduling** pass — it is the
-only scheduler, so `compare` numbers are unambiguous. A **Joint Solver** may
-be introduced later as an alternative scheduler producing the same
-artifacts. If the checkout under test has BOTH schedulers available, do not
-guess: **ask the user whether the comparison is about Modulo Scheduling
-kernels or Joint Solver kernels** (i.e. which scheduler produced — or should
-regenerate — the fixtures being measured) before running `compare`.
+only scheduler in the codebase, so `compare` numbers are unambiguous. A
+**Joint Solver** may be introduced later as an alternative scheduler
+producing the same artifacts. If you find that the codebase contains BOTH
+the Modulo Scheduling code and Joint Solver code (e.g. a joint-solver
+module or pass exists in the source tree alongside the modulo scheduler),
+do not guess: **ask the user whether the comparison is about Modulo
+Scheduling kernels or Joint Solver kernels** (i.e. which scheduler
+produced — or should regenerate — the fixtures being measured) before
+running `compare`.
 
 ## Regenerating fixtures
 
