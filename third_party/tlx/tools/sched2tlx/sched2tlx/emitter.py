@@ -6137,6 +6137,80 @@ def _emit_uwg_body_impl(
 # ===========================================================================
 
 
+def _swap_grid_const(op: Op, c: int, npref: OpRef) -> None:
+    """Replace every ConstRef operand equal to the baked stride `c` with the
+    num_programs ref. `bool` is excluded — `True`/`False` are `int`s and 1/0
+    could otherwise alias a stride."""
+    op.operands = [
+        npref if (isinstance(o, ConstRef) and not isinstance(o.value, bool)
+                  and o.value == c)
+        else o
+        for o in op.operands
+    ]
+
+
+def _persistent_nprog_ref(graph: ScheduleGraph, lb_id: str, axis: int) -> OpRef:
+    """OpRef to a function-scope tt.get_num_programs(axis), reused if one
+    already exists, else synthesized and inserted right after the
+    get_program_id lower bound (the preamble names function-scope ops in table
+    order and the stride's first use can be an iter_arg init)."""
+    for op in graph.ops.values():
+        if (op.kind == "tt.get_num_programs" and op.scope == "function"
+                and op.attributes.get("axis", 0) == axis):
+            return OpRef(op_id=op.op_id)
+    nprog = Op(
+        op_id=f"op_synth_nprog_{axis}",
+        kind="tt.get_num_programs",
+        scope="function",
+        operands=[],
+        result_types=["i32"],
+        attributes={"axis": axis},
+    )
+    new_ops: dict[str, Op] = {}
+    for oid, op in graph.ops.items():
+        new_ops[oid] = op
+        if oid == lb_id:  # lb_id is a live key (the caller resolved it)
+            new_ops[nprog.op_id] = nprog
+    graph.ops = new_ops
+    return OpRef(op_id=nprog.op_id)
+
+
+def _stride_carrier_iter_args(
+    graph: ScheduleGraph, for_op: Op, lb_id: str, c: int
+) -> set[int]:
+    """Indices of the loop's iter_args that carry the loop STRIDE.
+
+    An iter_arg carries the stride iff its scf.for init is `X ± C` where X
+    derives (transitively, through pass-through arithmetic) from the loop's
+    get_program_id lower bound — i.e. the `pid ± stride` induction seed the
+    modulo scheduler threads to reconstruct tile_id. Keying on that
+    provenance, not on bare value equality with C, is what keeps an unrelated
+    recurrence whose increment merely happens to equal the grid size (a
+    counter, a block-size offset) from being mis-rewritten.
+    """
+    def derives_from_lb(ref: OperandRef, depth: int = 0) -> bool:
+        if depth > 8 or not isinstance(ref, OpRef):
+            return False
+        if ref.op_id == lb_id:
+            return True
+        op = graph.ops.get(ref.op_id)
+        return op is not None and any(
+            derives_from_lb(o, depth + 1) for o in op.operands
+        )
+
+    carry: set[int] = set()
+    for idx, init in enumerate(for_op.operands[3:]):  # 0..2 are lo/hi/step
+        if not isinstance(init, OpRef):
+            continue
+        init_op = graph.ops.get(init.op_id)
+        if init_op is None or init_op.kind not in ("arith.subi", "arith.addi"):
+            continue
+        if (any(isinstance(o, ConstRef) and o.value == c for o in init_op.operands)
+                and any(derives_from_lb(o) for o in init_op.operands)):
+            carry.add(idx)
+    return carry
+
+
 def _derive_persistent_grid_strides(graph: ScheduleGraph) -> None:
     """Rewrite a constant persistent-loop stride to tl.num_programs.
 
@@ -6146,100 +6220,75 @@ def _derive_persistent_grid_strides(graph: ScheduleGraph) -> None:
     the dump, and the emitted kernel then silently reprocesses other CTAs'
     tiles at any other grid size (e.g. an occupancy-driven grid multiplier).
     tl.num_programs(axis) is identical at the baked grid and correct at every
-    other one.
+    other one. Runs before emission and normalizes the graph in place;
+    idempotent (a second pass sees the step is already an OpRef and stops).
 
-    Per outer loop whose lower bound is a get_program_id and whose step is an
-    integer constant C, this rewrites:
-      - schedule.step AND the scf.for op's step operand — together, since
-        _find_loop_for matches loops to their scf.for by (lo, hi, step)
-        equality;
-      - the recurrence carriers threading the same C through iter_args: init
-        ops among the scf.for's inits (only the `lb ± C` shape, i.e. the
-        stride seed) and `iter_arg ± C` updates in ANY scope (the compiler
-        may sink the tile-id recompute into a nested loop). _render_operand's
-        outer-loop iter_arg identity (iter_arg == iv - step) already assumes
-        every outer iter_arg advances by the loop stride; these carriers must
-        advance by the SAME stride or the emitted tile arithmetic diverges
-        from the loop's actual tiles.
-    Within those carrier ops the match is by value equality with C; constants
-    elsewhere in the graph (a shape, an offset) are never touched.
+    An outer loop qualifies when its lower bound is a get_program_id and its
+    step is an integer constant C > 1 (a launch grid; 0/1/negative is an
+    ordinary loop, and rewriting a `+1` recurrence would corrupt counters).
+    For each, this rewrites — all keyed to the loop's ACTUAL stride, never to
+    bare value equality with C across the whole graph:
+      - schedule.step AND the scf.for's step operand, together (they must stay
+        equal: _find_loop_for matches loops to their scf.for by (lo, hi, step)
+        equality). The scf.for is resolved for every eligible loop up front,
+        before any rewrite, so mutating one loop cannot break another's match;
+        a loop whose scf.for cannot be resolved is skipped whole rather than
+        left in a half-rewritten state.
+      - the stride seed inits (`pid ± C`, possibly through pass-through ops)
+        of the iter_args that carry the stride, and the `carry_iter_arg ± C`
+        and `iv ± C` recurrences (any scope — the scheduler may sink the
+        tile-id recompute into a nested loop) that advance by it.
+        _render_operand's outer-loop identity (iter_arg == iv - step) assumes
+        every such carrier advances by the loop stride.
+    Carriers are identified structurally (a stride-seeded iter_arg or the
+    induction var of THIS loop), so an unrelated recurrence that merely steps
+    by a value equal to C is left untouched.
     """
+    # Pass 1: resolve each eligible loop's scf.for while the graph is pristine.
+    jobs: list[tuple[Loop, Op, str, int, int]] = []
     for loop in graph.loops:
         if not loop.is_outer:
             continue
-        sched = loop.schedule
-        step = sched.step
-        if not isinstance(step, ConstRef) or not isinstance(step.value, int):
+        step = loop.schedule.step
+        if (not isinstance(step, ConstRef) or isinstance(step.value, bool)
+                or not isinstance(step.value, int) or step.value <= 1):
             continue
-        lb = sched.lower_bound
+        lb = loop.schedule.lower_bound
         if not isinstance(lb, OpRef):
             continue
         lb_op = graph.ops.get(lb.op_id)
         if lb_op is None or lb_op.kind != "tt.get_program_id":
             continue
-        axis = lb_op.attributes.get("axis", 0)
-        c = step.value
-
-        # Resolve the scf.for before the rewrite breaks the equality match.
         for_op = _find_loop_for(graph, loop)
+        if for_op is None:
+            # Can't rewrite the scf.for step consistently — leave the loop
+            # baked (correct at the baked grid, as before) rather than
+            # half-rewrite schedule.step and diverge from the scf.for.
+            continue
+        jobs.append((loop, for_op, lb.op_id, lb_op.attributes.get("axis", 0), step.value))
 
-        nprog_op = next(
-            (op for op in graph.ops.values()
-             if op.kind == "tt.get_num_programs" and op.scope == "function"
-             and op.attributes.get("axis", 0) == axis),
-            None,
-        )
-        if nprog_op is None:
-            nprog_op = Op(
-                op_id=f"op_synth_nprog_{axis}",
-                kind="tt.get_num_programs",
-                scope="function",
-                operands=[],
-                result_types=["i32"],
-                attributes={"axis": axis},
-            )
-            # Insert right after the get_program_id lower bound: the preamble
-            # emits (and names) function-scope ops in table order, and the
-            # stride's first use can be as early as an iter_arg init op.
-            new_ops: dict[str, Op] = {}
-            for oid, op in graph.ops.items():
-                new_ops[oid] = op
-                if oid == lb.op_id:
-                    new_ops[nprog_op.op_id] = nprog_op
-            if nprog_op.op_id not in new_ops:
-                new_ops[nprog_op.op_id] = nprog_op
-            graph.ops = new_ops
+    # Pass 2: rewrite.
+    for loop, for_op, lb_id, axis, c in jobs:
+        npref = _persistent_nprog_ref(graph, lb_id, axis)
+        carry = _stride_carrier_iter_args(graph, for_op, lb_id, c)
 
-        npref = OpRef(op_id=nprog_op.op_id)
-
-        def swap_step_const(op: Op) -> None:
-            op.operands = [
-                npref if (isinstance(o, ConstRef) and o.value == c) else o
-                for o in op.operands
-            ]
-
-        sched.step = npref
-        if for_op is not None:
-            for_op.operands[2] = npref
-            for init in for_op.operands[3:]:
-                if not isinstance(init, OpRef):
-                    continue
+        loop.schedule.step = npref
+        for_op.operands[2] = npref
+        for idx in carry:  # the `pid ± C` stride seeds
+            init = for_op.operands[3 + idx]
+            if isinstance(init, OpRef):
                 init_op = graph.ops.get(init.op_id)
-                # Only the stride seed `lb ± C` — an unrelated init that
-                # merely contains a value-equal constant stays untouched.
-                if (init_op is not None
-                        and init_op.kind in ("arith.subi", "arith.addi")
-                        and any(isinstance(o, OpRef) and o.op_id == lb.op_id
-                                for o in init_op.operands)):
-                    swap_step_const(init_op)
-        for op in graph.ops.values():
+                if init_op is not None:
+                    _swap_grid_const(init_op, c, npref)
+        for op in graph.ops.values():  # the `carry_iter_arg ± C` / `iv ± C` recurrences
             if op.kind not in ("arith.subi", "arith.addi"):
                 continue
             if any(
-                isinstance(o, IterArgRef) and o.loop_id == loop.loop_id
+                (isinstance(o, IterArgRef) and o.loop_id == loop.loop_id and o.idx in carry)
+                or (isinstance(o, IvRef) and o.loop_id == loop.loop_id)
                 for o in op.operands
             ):
-                swap_step_const(op)
+                _swap_grid_const(op, c, npref)
 
 
 def emit(graph: ScheduleGraph) -> str:
