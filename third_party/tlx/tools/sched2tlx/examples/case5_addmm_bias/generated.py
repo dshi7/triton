@@ -18,14 +18,15 @@ def addmm_persistent_2d_bias(
 ):
     # ── Preamble (function-scope ops before the loop) ──
     pid_0 = tl.program_id(0)
-    add_2 = (arg4 + 127)
-    div_3 = (add_2 // 128)
-    add_4 = (arg5 + 127)
-    div_5 = (add_4 // 128)
-    add_6 = (arg6 + 63)
-    div_7 = (add_6 // 64)
-    mul_8 = (div_3 * div_5)
-    sub_9 = (pid_0 - 148)
+    nprog_0 = tl.num_programs(0)
+    add_3 = (arg4 + 127)
+    div_4 = (add_3 // 128)
+    add_5 = (arg5 + 127)
+    div_6 = (add_5 // 128)
+    add_7 = (arg6 + 63)
+    div_8 = (add_7 // 64)
+    mul_9 = (div_4 * div_6)
+    sub_10 = (pid_0 - nprog_0)
 
     # ── Multi-buffered allocations (from modulo's lifetime analysis) ──
     # inner-loop buf 0: SMEM count=3 (modulo lifetime [557..1146], II=256)
@@ -57,72 +58,72 @@ def addmm_persistent_2d_bias(
         with tlx.async_task("default"):
             tmem_accum_cnt = 0
             # Outer persistent loop (loop 1, II=8192). Each task replays it; body trimmed to this WG's ops.
-            for tile_id in range(pid_0, mul_8, 148):
+            for tile_id in range(pid_0, mul_9, nprog_0):
                 tmem_buf = tmem_accum_cnt % 2
                 tmem_phase = (tmem_accum_cnt // 2) & 1
-                add_10 = ((tile_id - 148) + 148)
-                div_11 = (add_10 // div_5)
-                rem_12 = (add_10 % div_5)
-                mul_13 = (div_11 * 128)
-                mul_14 = (rem_12 * 128)
+                add_11 = ((tile_id - nprog_0) + nprog_0)
+                div_12 = (add_11 // div_6)
+                rem_13 = (add_11 % div_6)
+                mul_14 = (div_12 * 128)
+                mul_15 = (rem_13 * 128)
                 tlx.barrier_wait(outer_load_12_smem_empty[0], (tmem_accum_cnt & 1) ^ 1)
                 tlx.barrier_expect_bytes(outer_load_12_smem_full[0], 32768)
-                tlx.async_descriptor_load(arg2, outer_load_12_smem[0], [mul_13, mul_14], outer_load_12_smem_full[0])
+                tlx.async_descriptor_load(arg2, outer_load_12_smem[0], [mul_14, mul_15], outer_load_12_smem_full[0])
                 tlx.barrier_wait(outer_load_12_smem_full[0], tmem_accum_cnt & 1)
                 load_12 = tlx.local_load(outer_load_12_smem[0])
                 tlx.barrier_arrive(outer_load_12_smem_empty[0], 1)
-                ext_15 = load_12.to(tl.float32)
+                ext_16 = load_12.to(tl.float32)
                 tlx.barrier_wait(acc_tmem_full[tmem_buf], tmem_phase)
                 acc = tlx.local_load(acc_tmem[tmem_buf])
                 tlx.barrier_arrive(acc_tmem_empty[tmem_buf], 1)
-                trunc_16 = (acc + ext_15).to(tl.float16)
-                tlx.local_store(c_smem[0], trunc_16)
+                trunc_17 = (acc + ext_16).to(tl.float16)
+                tlx.local_store(c_smem[0], trunc_17)
                 tlx.fence_async_shared()
-                tlx.async_descriptor_store(arg3, c_smem[0], [mul_13, mul_14])
+                tlx.async_descriptor_store(arg3, c_smem[0], [mul_14, mul_15])
                 tlx.async_descriptor_store_wait(0)
                 tmem_accum_cnt += 1
         # Async task: role=TMA ← inner wg0 (Phase 4 plan)
         with tlx.async_task(num_warps=1, num_regs=24):
             smem_accum = 0
             # Outer persistent loop (loop 1, II=8192). Each task replays it; body trimmed to this WG's ops.
-            for tile_id in range(pid_0, mul_8, 148):
+            for tile_id in range(pid_0, mul_9, nprog_0):
                 # Inner K-loop (loop 0, II=256). SMEM ring depth=3; smem_accum persists across outer tiles.
-                for k in range(0, div_7, 1):
+                for k in range(0, div_8, 1):
                     _it = smem_accum
                     buf = smem_accum % 3
                     phase = (smem_accum // 3) & 1
                     # load → L0_smem_0
                     tlx.barrier_wait(L0_smem_0_empty[buf], phase ^ 1)
                     tlx.barrier_expect_bytes(L0_smem_0_full[buf], 16384)
-                    tlx.async_descriptor_load(arg0, L0_smem_0[buf], [((tile_id // div_5) * 128), (k * 64)], L0_smem_0_full[buf])
+                    tlx.async_descriptor_load(arg0, L0_smem_0[buf], [((tile_id // div_6) * 128), (k * 64)], L0_smem_0_full[buf])
                     smem_accum += 1
         # Async task: role=TMA ← inner wg1 (Phase 4 plan)
         with tlx.async_task(num_warps=1, num_regs=24):
             smem_accum = 0
             # Outer persistent loop (loop 1, II=8192). Each task replays it; body trimmed to this WG's ops.
-            for tile_id in range(pid_0, mul_8, 148):
+            for tile_id in range(pid_0, mul_9, nprog_0):
                 # Inner K-loop (loop 0, II=256). SMEM ring depth=3; smem_accum persists across outer tiles.
-                for k in range(0, div_7, 1):
+                for k in range(0, div_8, 1):
                     _it = smem_accum
                     buf = smem_accum % 3
                     phase = (smem_accum // 3) & 1
                     # load → L0_smem_1
                     tlx.barrier_wait(L0_smem_1_empty[buf], phase ^ 1)
                     tlx.barrier_expect_bytes(L0_smem_1_full[buf], 16384)
-                    tlx.async_descriptor_load(arg1, L0_smem_1[buf], [(k * 64), ((tile_id % div_5) * 128)], L0_smem_1_full[buf])
+                    tlx.async_descriptor_load(arg1, L0_smem_1[buf], [(k * 64), ((tile_id % div_6) * 128)], L0_smem_1_full[buf])
                     smem_accum += 1
         # Async task: role=TC ← inner wg2 (Phase 4 plan)
         with tlx.async_task(num_warps=1, num_regs=24):
             smem_accum = 0
             tmem_accum_cnt = 0
             # Outer persistent loop (loop 1, II=8192). Each task replays it; body trimmed to this WG's ops.
-            for tile_id in range(pid_0, mul_8, 148):
+            for tile_id in range(pid_0, mul_9, nprog_0):
                 tmem_buf = tmem_accum_cnt % 2
                 tmem_phase = (tmem_accum_cnt // 2) & 1
                 tlx.barrier_wait(acc_tmem_empty[tmem_buf], tmem_phase ^ 1)
                 i0_0 = False
                 # Inner K-loop (loop 0, II=256). SMEM ring depth=3; smem_accum persists across outer tiles.
-                for k in range(0, div_7, 1):
+                for k in range(0, div_8, 1):
                     _it = smem_accum
                     buf = smem_accum % 3
                     phase = (smem_accum // 3) & 1
