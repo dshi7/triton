@@ -68,6 +68,17 @@ Deep-dive per-case scripts (outside the harness): case4
 pool-vs-sum A/B); any case's `run_*.py` runner for correctness-only
 (case8's is `run_triple_gemm_nows.py`).
 
+## Scheduler provenance: Modulo Scheduling vs Joint Solver
+
+Today the corpus fixtures (`schedule_graph.json` and the committed
+`generated.py`) are produced by the **Modulo Scheduling** pass — it is the
+only scheduler, so `compare` numbers are unambiguous. A **Joint Solver** may
+be introduced later as an alternative scheduler producing the same
+artifacts. If the checkout under test has BOTH schedulers available, do not
+guess: **ask the user whether the comparison is about Modulo Scheduling
+kernels or Joint Solver kernels** (i.e. which scheduler produced — or should
+regenerate — the fixtures being measured) before running `compare`.
+
 ## Regenerating fixtures
 
 ```
