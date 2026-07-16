@@ -73,14 +73,14 @@ def _scaled_mm_blockwise(
             # Outer persistent loop (loop 1, II=45824). Each task replays it; body trimmed to this WG's ops.
             for tile_id in range(pid_0, mul_13, nprog_0):
                 # Inner K-loop (loop 0, II=1432). SMEM ring depth=1; smem_accum persists across outer tiles.
-                for g in range(0, div_15, 1):
+                for k in range(0, div_15, 1):
                     _it = smem_accum
                     buf = smem_accum % 1
                     phase = (smem_accum // 1) & 1
                     # load → L0_smem_0
                     tlx.barrier_wait(L0_smem_0_empty[0], (_it & 1) ^ 1)
                     tlx.barrier_expect_bytes(L0_smem_0_full[0], 16384)
-                    tlx.async_descriptor_load(a_desc, L0_smem_0[0], [((tile_id // div_12) * 128), (g * 128)], L0_smem_0_full[0])
+                    tlx.async_descriptor_load(a_desc, L0_smem_0[0], [((tile_id // div_12) * 128), (k * 128)], L0_smem_0_full[0])
                     smem_accum += 1
         # Async task: role=TMA ← inner wg1 (Phase 4 plan)
         with tlx.async_task(num_warps=1, num_regs=24):
@@ -88,14 +88,14 @@ def _scaled_mm_blockwise(
             # Outer persistent loop (loop 1, II=45824). Each task replays it; body trimmed to this WG's ops.
             for tile_id in range(pid_0, mul_13, nprog_0):
                 # Inner K-loop (loop 0, II=1432). SMEM ring depth=1; smem_accum persists across outer tiles.
-                for g in range(0, div_15, 1):
+                for k in range(0, div_15, 1):
                     _it = smem_accum
                     buf = smem_accum % 1
                     phase = (smem_accum // 1) & 1
                     # load → L0_smem_1
                     tlx.barrier_wait(L0_smem_1_empty[0], (_it & 1) ^ 1)
                     tlx.barrier_expect_bytes(L0_smem_1_full[0], 16384)
-                    tlx.async_descriptor_load(b_desc, L0_smem_1[0], [((tile_id % div_12) * 128), (g * 128)], L0_smem_1_full[0])
+                    tlx.async_descriptor_load(b_desc, L0_smem_1[0], [((tile_id % div_12) * 128), (k * 128)], L0_smem_1_full[0])
                     smem_accum += 1
         # Async task: role=TC ← inner wg2 (Phase 4 plan)
         with tlx.async_task(num_warps=1, num_regs=24):
@@ -107,7 +107,7 @@ def _scaled_mm_blockwise(
                 tmem_buf = tmem_accum_cnt % 1
                 tmem_phase = (tmem_accum_cnt // 1) & 1
                 # Inner K-loop (loop 0, II=1432). SMEM ring depth=1; smem_accum persists across outer tiles.
-                for g in range(0, div_15, 1):
+                for k in range(0, div_15, 1):
                     _it = smem_accum
                     buf = smem_accum % 1
                     phase = (smem_accum // 1) & 1
@@ -128,11 +128,11 @@ def _scaled_mm_blockwise(
             # Outer persistent loop (loop 1, II=45824). Each task replays it; body trimmed to this WG's ops.
             for tile_id in range(pid_0, mul_13, nprog_0):
                 # Inner K-loop (loop 0, II=1432). SMEM ring depth=1; smem_accum persists across outer tiles.
-                for g in range(0, div_15, 1):
+                for k in range(0, div_15, 1):
                     _it = smem_accum
                     buf = smem_accum % 1
                     phase = (smem_accum // 1) & 1
-                    mul_17 = (g * stride_sa_g)
+                    mul_17 = (k * stride_sa_g)
                     splat_18 = mul_17
                     addptr_19 = ((ScaleA + (((tile_id // div_12) * 128) + _wgloc600)) + splat_18)
                     v_20 = tl.load(addptr_19)
@@ -140,7 +140,7 @@ def _scaled_mm_blockwise(
                     tlx.local_store(L0_smem_2[0], v_20)
                     tlx.barrier_arrive(sem2_b2_full[0], 1)
                     smem_accum += 1
-        # Async task: role=default ← outer wg0 (Phase 4 plan)
+        # Async task: role=default ← outer wg4 (Phase 4 plan)
         with tlx.async_task("default"):
             smem_accum = 0
             tmem_accum_cnt = 0
@@ -159,11 +159,11 @@ def _scaled_mm_blockwise(
                 mul_26 = (rem_22 * 128)
                 i0_0 = tl.full((128, 128), 0, tl.float32)
                 # Inner K-loop (loop 0, II=1432). SMEM ring depth=1; smem_accum persists across outer tiles.
-                for g in range(0, div_15, 1):
+                for k in range(0, div_15, 1):
                     _it = smem_accum
                     buf = smem_accum % 1
                     phase = (smem_accum // 1) & 1
-                    addptr_27 = ((ScaleB + mul_25) + g)
+                    addptr_27 = ((ScaleB + mul_25) + k)
                     v_28 = tl.load(addptr_27)
                     splat_29 = v_28
                     tlx.barrier_wait(sem2_b2_full[0], (_it & 1))

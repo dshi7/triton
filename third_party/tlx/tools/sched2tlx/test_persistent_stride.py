@@ -173,17 +173,30 @@ def test_idempotent():
 
 
 def test_shipped_fixtures_reemit_identically():
-    print("== the three shipped persistent fixtures re-emit byte-identically ==")
+    print("== every shipped generated*.py re-emits byte-identically from its graph ==")
     root = Path(__file__).resolve().parent
-    for case in ("case2_persistent_gemm", "case5_addmm_bias", "case9_scaled_mm/blockwise"):
-        d = root / "examples" / case
+    # Discover all generated*.py that have a matching schedule_graph*.json
+    # (generated.py<->schedule_graph.json, generated_base.py<->schedule_graph_base.json, ...).
+    pairs = []
+    for gp in sorted((root / "examples").rglob("generated*.py")):
+        sg = gp.with_name("schedule_graph" + gp.stem[len("generated"):] + ".json")
+        if not sg.exists():
+            continue
+        # The multi-phase emitter path lives on another branch; case8's
+        # committed fixture predates it and is not regenerable here (it
+        # diverges on plain main too) — a pre-existing, unrelated drift.
+        if "(multi-phase)" in gp.read_text(errors="ignore")[:200]:
+            continue
+        pairs.append((gp, sg))
+    check(len(pairs) >= 3, f"found {len(pairs)} generated/schedule_graph pairs")
+    for gp, sg in pairs:
         proc = subprocess.run(
-            [sys.executable, "-m", "sched2tlx", str(d / "schedule_graph.json")],
+            [sys.executable, "-m", "sched2tlx", str(sg)],
             cwd=str(root), capture_output=True, text=True,
         )
-        got = proc.stdout
-        want = (d / "generated.py").read_text()
-        check(proc.returncode == 0 and got == want, f"{case} re-emits byte-identically")
+        rel = gp.relative_to(root / "examples")
+        check(proc.returncode == 0 and proc.stdout == gp.read_text(),
+              f"{rel} re-emits byte-identically")
 
 
 def main():
