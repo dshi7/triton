@@ -53,9 +53,10 @@ def gen_call(generated, inputs):
 
 
 def hw_call(handwritten, inputs):
-    # No handwritten WS reference wired for case9 yet; perf_harness only calls this
-    # when handwritten.py exists, so it is never reached today.
-    raise NotImplementedError("case9 blockwise has no handwritten reference yet")
+    # handwritten.py exists, so run_bench DOES invoke this on every run; raising
+    # makes the harness's best-effort hw path degrade to gen-only reporting
+    # (raw throughput) until a handwritten launch is actually wired here.
+    raise NotImplementedError("case9 blockwise handwritten launch not wired yet")
 
 
 def metric(shape):
